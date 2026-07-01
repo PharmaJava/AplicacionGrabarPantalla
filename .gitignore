@@ -8,5 +8,8 @@ __pycache__/
 /2.0/build/
 /2.0/dist/
 
+# Instalador generado por Inno Setup (se recrea con build_installer.bat)
+/installer_output/
+
 # Configuración local del editor / Claude Code
 .claude/

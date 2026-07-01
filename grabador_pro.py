@@ -23,6 +23,7 @@ import sys
 import time
 import signal
 import shutil
+import tempfile
 import threading
 import subprocess
 from datetime import datetime
@@ -38,6 +39,22 @@ APP_NAME = "Grabador de Pantalla PRO"
 
 # Evita que se abran ventanas de consola al lanzar FFmpeg (build --windowed).
 CREATE_NO_WINDOW = 0x08000000
+
+# Log de depuración persistente: como la app es --windowed, no hay consola
+# donde ver los print(); esto permite diagnosticar problemas después de
+# cerrar la aplicación, sin depender de tener una consola abierta.
+LOG_FILE = os.path.join(tempfile.gettempdir(), "GrabadorPantallaPRO_debug.log")
+
+
+def log_debug(*parts):
+    msg = " ".join(str(p) for p in parts)
+    line = f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {msg}"
+    print(line)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -91,39 +108,36 @@ def resource_path(name):
     return path if os.path.isfile(path) else None
 
 
-def _hide_console_window(pid, timeout=1.0):
-    """Oculta la ventana de consola de un proceso hijo (por su PID).
+def ensure_hidden_console():
+    """Da a ESTE proceso (la app) una consola propia, oculta, si no tiene ya.
 
-    FFmpeg necesita su propia consola para poder recibir CTRL_BREAK_EVENT
-    (ver comentario en ScreenRecorder.start), pero no queremos que se vea.
-    Se busca la ventana recién creada por PID y se oculta con ShowWindow;
-    la consola sigue existiendo (y recibiendo señales), solo que invisible.
+    GenerateConsoleCtrlEvent (usada para enviar CTRL_BREAK_EVENT y detener
+    FFmpeg limpiamente) exige que el proceso que LLAMA a la función esté
+    adjunto a una consola; si no, falla con "WinError 6: Controlador no
+    válido" y la señal nunca llega, sin importar lo que tenga FFmpeg.
+
+    Como la app se compila con --windowed (sin consola propia), hay que
+    crearle una al arrancar y ocultarla enseguida. FFmpeg, al lanzarse sin
+    pedir una consola nueva, hereda automáticamente esta consola oculta
+    (no crea ninguna ventana visible propia).
     """
     try:
+        kernel32 = ctypes.windll.kernel32
         user32 = ctypes.windll.user32
-        WNDENUMPROC = ctypes.WINFUNCTYPE(
-            ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-        found = {"hwnd": None}
-
-        def _callback(hwnd, _lparam):
-            found_pid = ctypes.c_ulong()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(found_pid))
-            if found_pid.value == pid:
-                found["hwnd"] = hwnd
-                return False  # detiene la enumeración
-            return True
-
-        deadline = time.time() + timeout
-        while time.time() < deadline and not found["hwnd"]:
-            user32.EnumWindows(WNDENUMPROC(_callback), 0)
-            if not found["hwnd"]:
-                time.sleep(0.02)
-
-        if found["hwnd"]:
+        if kernel32.GetConsoleWindow():
+            log_debug("La app ya tenía consola (ejecutándose desde una terminal).")
+            return
+        if not kernel32.AllocConsole():
+            log_debug("AllocConsole() falló:", ctypes.get_last_error())
+            return
+        hwnd = kernel32.GetConsoleWindow()
+        if hwnd:
             SW_HIDE = 0
-            user32.ShowWindow(found["hwnd"], SW_HIDE)
+            user32.ShowWindow(hwnd, SW_HIDE)
+        log_debug(f"Consola propia creada y ocultada (hwnd={hwnd}). "
+                  f"FFmpeg la heredará sin abrir ninguna ventana nueva.")
     except Exception as exc:  # noqa: BLE001
-        print("No se pudo ocultar la consola de FFmpeg:", exc)
+        log_debug("No se pudo crear/ocultar la consola propia:", exc)
 
 
 def get_monitors():
@@ -279,33 +293,36 @@ class ScreenRecorder:
             cmd += ["-c:a", "aac"]
         cmd += [output_file]
 
-        print("Comando FFmpeg:", " ".join(cmd))
+        log_debug("Comando FFmpeg:", " ".join(cmd))
 
         self.process = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            # OJO: aquí NO se usa CREATE_NO_WINDOW. Sin una consola real
-            # adjunta, Windows no tiene forma de entregarle CTRL_BREAK_EVENT
-            # a FFmpeg (la señal se pierde silenciosamente), así que al
-            # detener la grabación se agota el timeout y se acaba matando el
-            # proceso en seco, dejando el MP4 sin el "moov atom" (corrupto).
-            # Por eso se crea con su propia consola (CREATE_NEW_PROCESS_GROUP)
-            # y se oculta la ventana justo después con _hide_console_window().
+            # CREATE_NEW_PROCESS_GROUP: FFmpeg queda en su propio grupo de
+            # procesos (necesario para poder enviarle luego CTRL_BREAK_EVENT
+            # sin afectarnos a nosotros mismos). No se pide CREATE_NEW_CONSOLE
+            # a propósito: así FFmpeg hereda la consola oculta que la app se
+            # crea al arrancar (ver ensure_hidden_console()) en vez de abrir
+            # una ventana nueva. Esa consola compartida es imprescindible:
+            # GenerateConsoleCtrlEvent solo funciona entre procesos que
+            # comparten la misma consola.
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
-        _hide_console_window(self.process.pid)
+        log_debug(f"FFmpeg lanzado, pid={self.process.pid}")
 
         threading.Thread(
             target=self._drain_output, args=(self.process,), daemon=True
         ).start()
 
     def _drain_output(self, proc):
-        """Vuelca la salida de FFmpeg a la consola (útil para depurar)."""
+        """Vuelca la salida de FFmpeg al log (útil para depurar)."""
         try:
             for line in iter(proc.stderr.readline, b""):
-                print("[FFmpeg]", line.decode("utf-8", "ignore").rstrip())
+                text = line.decode("utf-8", "ignore").rstrip()
+                if text:
+                    log_debug("[FFmpeg]", text)
         except Exception:  # noqa: BLE001
             pass
 
@@ -319,6 +336,7 @@ class ScreenRecorder:
 
         proc = self.process
         self.process = None
+        log_debug(f"Deteniendo FFmpeg pid={proc.pid}...")
 
         # CTRL_BREAK_EVENT hace que FFmpeg finalice y cierre el MP4
         # correctamente (escribe el trailer). En Windows, escribir "q" por
@@ -326,17 +344,29 @@ class ScreenRecorder:
         # que solo funcionan sobre una consola real, no sobre un pipe.
         try:
             proc.send_signal(signal.CTRL_BREAK_EVENT)
+            log_debug("CTRL_BREAK_EVENT enviado correctamente.")
         except Exception as exc:  # noqa: BLE001
-            print("No se pudo enviar CTRL_BREAK_EVENT:", exc)
+            log_debug("ERROR al enviar CTRL_BREAK_EVENT:", exc)
 
         try:
             proc.wait(timeout=10)
-        except Exception:  # noqa: BLE001
+            log_debug(f"FFmpeg terminó solo tras la señal. "
+                      f"Código de salida: {proc.returncode}")
+        except Exception as exc:  # noqa: BLE001
+            log_debug(f"FFmpeg NO respondió a la señal en 10s "
+                      f"({exc}); forzando terminate()...")
             try:
                 proc.terminate()
                 proc.wait(timeout=5)
-            except Exception:  # noqa: BLE001
-                pass
+                log_debug(f"FFmpeg matado a la fuerza (moov atom probable-"
+                          f"mente perdido). returncode={proc.returncode}")
+            except Exception as exc2:  # noqa: BLE001
+                log_debug("ERROR también al forzar terminate():", exc2)
+
+        exists = os.path.isfile(self.output_file) if self.output_file else False
+        size = os.path.getsize(self.output_file) if exists else 0
+        log_debug(f"Archivo final: {self.output_file} existe={exists} "
+                  f"tamaño={size} bytes")
 
         return self.output_file
 
@@ -438,6 +468,8 @@ class RecorderApp:
 
         # Ayuda
         help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="Ver registro de depuración…",
+                             command=self.open_debug_log)
         help_menu.add_command(label="Acerca de…", command=self.show_about)
         menubar.add_cascade(label="Ayuda", menu=help_menu)
 
@@ -700,6 +732,16 @@ class RecorderApp:
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror(APP_NAME, f"No se pudo abrir la carpeta:\n{exc}")
 
+    def open_debug_log(self):
+        if not os.path.isfile(LOG_FILE):
+            messagebox.showinfo(
+                APP_NAME, "Todavía no hay ningún registro (graba algo primero).")
+            return
+        try:
+            os.startfile(LOG_FILE)  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(APP_NAME, f"No se pudo abrir el registro:\n{exc}")
+
     def start_recording(self):
         if self.is_recording:
             return
@@ -845,6 +887,7 @@ class RecorderApp:
 
 
 def main():
+    ensure_hidden_console()
     root = tk.Tk()
     try:
         # Tema visual algo más moderno si está disponible.

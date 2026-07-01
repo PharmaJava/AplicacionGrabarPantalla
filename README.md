@@ -48,10 +48,36 @@ dist\GrabadorPantallaPRO.exe
 Ese único archivo ya lleva FFmpeg dentro. Cópialo a cualquier PC con Windows
 y funciona con doble clic.
 
-> El `.exe` ocupa bastante (~150 MB) porque incluye FFmpeg completo. Es el
+> El `.exe` ocupa bastante (~70 MB) porque incluye FFmpeg completo. Es el
 > precio de que sea 100 % portable. Si prefieres un `.exe` pequeño, edita
 > `grabador_pro.spec` y deja `binaries = []`; entonces deberás copiar
 > `ffmpeg.exe` junto al ejecutable (o tenerlo en el PATH).
+
+## Generar el instalador (Setup.exe)
+
+Para distribuir la app como un instalador normal de Windows (con asistente,
+accesos directos en el Menú Inicio/Escritorio y desinstalador), en vez de
+repartir el `.exe` suelto:
+
+1. Instala [Inno Setup 6](https://jrsoftware.org/isdl.php) (gratuito).
+2. Genera primero el ejecutable con `build.bat` (paso anterior).
+3. Haz **doble clic** en `build_installer.bat`, o desde una terminal:
+
+   ```bat
+   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+   ```
+
+El instalador se genera en:
+
+```
+installer_output\GrabadorPantallaPRO_Setup.exe
+```
+
+Ese archivo es el que se reparte: al ejecutarlo en cualquier PC con Windows,
+instala la app en Archivos de Programa, crea el acceso directo en el Menú
+Inicio (y opcionalmente en el Escritorio) y registra un desinstalador en
+"Aplicaciones y características". No requiere tener Python, FFmpeg ni nada
+más instalado en el equipo de destino.
 
 ## Cómo localiza FFmpeg la aplicación
 
