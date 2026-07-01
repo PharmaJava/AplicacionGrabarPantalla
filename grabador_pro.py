@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import time
+import signal
 import shutil
 import threading
 import subprocess
@@ -90,6 +91,41 @@ def resource_path(name):
     return path if os.path.isfile(path) else None
 
 
+def _hide_console_window(pid, timeout=1.0):
+    """Oculta la ventana de consola de un proceso hijo (por su PID).
+
+    FFmpeg necesita su propia consola para poder recibir CTRL_BREAK_EVENT
+    (ver comentario en ScreenRecorder.start), pero no queremos que se vea.
+    Se busca la ventana recién creada por PID y se oculta con ShowWindow;
+    la consola sigue existiendo (y recibiendo señales), solo que invisible.
+    """
+    try:
+        user32 = ctypes.windll.user32
+        WNDENUMPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        found = {"hwnd": None}
+
+        def _callback(hwnd, _lparam):
+            found_pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(found_pid))
+            if found_pid.value == pid:
+                found["hwnd"] = hwnd
+                return False  # detiene la enumeración
+            return True
+
+        deadline = time.time() + timeout
+        while time.time() < deadline and not found["hwnd"]:
+            user32.EnumWindows(WNDENUMPROC(_callback), 0)
+            if not found["hwnd"]:
+                time.sleep(0.02)
+
+        if found["hwnd"]:
+            SW_HIDE = 0
+            user32.ShowWindow(found["hwnd"], SW_HIDE)
+    except Exception as exc:  # noqa: BLE001
+        print("No se pudo ocultar la consola de FFmpeg:", exc)
+
+
 def get_monitors():
     """Enumera los monitores conectados usando la API de Windows (ctypes).
 
@@ -130,7 +166,15 @@ def get_monitors():
 
 
 def list_audio_devices(ffmpeg_path):
-    """Lista los dispositivos de audio (DirectShow) disponibles con FFmpeg."""
+    """Lista los dispositivos de audio (DirectShow) disponibles con FFmpeg.
+
+    Devuelve una lista de dicts {"name": nombre_visible, "alt": nombre_alt}.
+    El "nombre alternativo" (p.ej. "@device_cm_{GUID}\\wave_{GUID}") es un
+    identificador ASCII estable que FFmpeg también acepta con "-i audio=...".
+    Se usa ese en vez del nombre visible porque, en Windows, los nombres con
+    tildes/ñ pueden sufrir un problema de codificación al pasarlos de vuelta
+    como argumento y FFmpeg entonces no encuentra el dispositivo.
+    """
     devices = []
     if not ffmpeg_path:
         return devices
@@ -144,10 +188,10 @@ def list_audio_devices(ffmpeg_path):
             text=True,
             creationflags=CREATE_NO_WINDOW,
         )
-        text = result.stderr or ""
+        lines = (result.stderr or "").splitlines()
 
         mode = None  # "audio" o "video" según la sección en la que estemos
-        for line in text.splitlines():
+        for i, line in enumerate(lines):
             low = line.lower()
             if "directshow audio devices" in low:
                 mode = "audio"
@@ -165,16 +209,21 @@ def list_audio_devices(ffmpeg_path):
 
             # FFmpeg nuevo marca "(audio)"; el antiguo usa la cabecera de sección.
             if "(audio)" in low or (mode == "audio" and "(video)" not in low):
-                devices.append(name)
+                alt = None
+                if i + 1 < len(lines) and "alternative name" in lines[i + 1].lower():
+                    alt_match = re.search(r'"([^"]+)"', lines[i + 1])
+                    if alt_match:
+                        alt = alt_match.group(1)
+                devices.append({"name": name, "alt": alt})
     except Exception as exc:  # noqa: BLE001
         print("No se pudieron listar los dispositivos de audio:", exc)
 
-    # Elimina duplicados conservando el orden.
+    # Elimina duplicados (por nombre) conservando el orden.
     seen = set()
     unique = []
     for dev in devices:
-        if dev not in seen:
-            seen.add(dev)
+        if dev["name"] not in seen:
+            seen.add(dev["name"])
             unique.append(dev)
     return unique
 
@@ -237,8 +286,16 @@ class ScreenRecorder:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            creationflags=CREATE_NO_WINDOW,
+            # OJO: aquí NO se usa CREATE_NO_WINDOW. Sin una consola real
+            # adjunta, Windows no tiene forma de entregarle CTRL_BREAK_EVENT
+            # a FFmpeg (la señal se pierde silenciosamente), así que al
+            # detener la grabación se agota el timeout y se acaba matando el
+            # proceso en seco, dejando el MP4 sin el "moov atom" (corrupto).
+            # Por eso se crea con su propia consola (CREATE_NEW_PROCESS_GROUP)
+            # y se oculta la ventana justo después con _hide_console_window().
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
+        _hide_console_window(self.process.pid)
 
         threading.Thread(
             target=self._drain_output, args=(self.process,), daemon=True
@@ -263,14 +320,14 @@ class ScreenRecorder:
         proc = self.process
         self.process = None
 
-        # Enviar 'q' por stdin hace que FFmpeg cierre el archivo correctamente.
+        # CTRL_BREAK_EVENT hace que FFmpeg finalice y cierre el MP4
+        # correctamente (escribe el trailer). En Windows, escribir "q" por
+        # stdin NO sirve aquí: FFmpeg lee el teclado con _kbhit()/_getch(),
+        # que solo funcionan sobre una consola real, no sobre un pipe.
         try:
-            if proc.stdin:
-                proc.stdin.write(b"q")
-                proc.stdin.flush()
-                proc.stdin.close()
-        except Exception:  # noqa: BLE001
-            pass
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+        except Exception as exc:  # noqa: BLE001
+            print("No se pudo enviar CTRL_BREAK_EVENT:", exc)
 
         try:
             proc.wait(timeout=10)
@@ -486,7 +543,7 @@ class RecorderApp:
 
         # Audio
         self.audio_devices = list_audio_devices(self.ffmpeg_path)
-        audio_labels = list(self.audio_devices) + [self.NO_AUDIO_LABEL]
+        audio_labels = [d["name"] for d in self.audio_devices] + [self.NO_AUDIO_LABEL]
         self.audio_combo["values"] = audio_labels
         if self.audio_var.get() not in audio_labels:
             self.audio_var.set(audio_labels[0])
@@ -614,10 +671,18 @@ class RecorderApp:
             self.quality_var.get(), self.QUALITY_OPTIONS["Media (equilibrada)"])
 
     def _selected_audio(self):
-        """Devuelve el dispositivo de audio elegido o None (sin audio)."""
+        """Devuelve el identificador de audio a pasar a FFmpeg (o None).
+
+        Se usa el "nombre alternativo" (ASCII, tipo @device_cm_{GUID}\\wave_
+        {GUID}) en vez del nombre visible, para evitar que los acentos/ñ del
+        nombre real del dispositivo se corrompan al pasarlos como argumento.
+        """
         label = self.audio_var.get()
         if label == self.NO_AUDIO_LABEL or not label:
             return None
+        for dev in self.audio_devices:
+            if dev["name"] == label:
+                return dev["alt"] or dev["name"]
         return label
 
     def choose_output_folder(self):
