@@ -1,0 +1,1 @@
+ffmpeg -y -f gdigrab -framerate 30 -i desktop -f dshow -i "audio=Varios micrófonos (Realtek(R) Audio)" -vcodec libx264 -acodec aac -strict experimental -pix_fmt yuv420p output.mp4

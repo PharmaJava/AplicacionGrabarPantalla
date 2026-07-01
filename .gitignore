@@ -1,0 +1,12 @@
+# Bytecode / caché de Python
+__pycache__/
+*.pyc
+
+# Carpetas generadas por PyInstaller (se recrean con build.bat)
+/build/
+/dist/
+/2.0/build/
+/2.0/dist/
+
+# Configuración local del editor / Claude Code
+.claude/
