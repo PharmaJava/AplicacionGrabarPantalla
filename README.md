@@ -4,6 +4,14 @@ Aplicación de escritorio para **Windows** que graba la pantalla con audio
 usando FFmpeg. Pensada para funcionar en **cualquier ordenador o portátil**
 sin instalar nada.
 
+## Descargar
+
+👉 [**Descargar el instalador (última versión)**](https://github.com/PharmaJava/AplicacionGrabarPantalla/releases/latest)
+
+Descarga `GrabadorPantallaPRO_Setup.exe`, ejecútalo y sigue el asistente.
+Windows puede avisar de "Editor desconocido" (el instalador no está firmado
+digitalmente); pulsa "Más información" → "Ejecutar de todas formas".
+
 ## Características
 
 - **Icono propio** en el ejecutable y en la ventana.
