@@ -27,6 +27,7 @@ datas = []
 if os.path.isfile("icon.ico"):
     datas.append(("icon.ico", "."))
 ICON = "icon.ico" if os.path.isfile("icon.ico") else None
+VERSION_FILE = "version_info.txt" if os.path.isfile("version_info.txt") else None
 
 
 a = Analysis(
@@ -64,4 +65,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=ICON,
+    version=VERSION_FILE,
 )
